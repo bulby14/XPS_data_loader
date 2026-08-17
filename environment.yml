@@ -1,0 +1,11 @@
+name: XPS_data_loader
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - numpy
+  - matplotlib
+  - h5py
+  - ipympl
+  - ipykernel
+  - jupyterlab

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from import_xy import Region, Scan
+from scripts.import_xy import Region, Scan
 
 logger = logging.getLogger(__name__)
 

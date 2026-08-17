@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 import posixpath
 
-from import_xy import parse_xy_file
-from xy_loader import stack_region
+from scripts.import_xy import parse_xy_file
+from scripts.xy_loader import stack_region
 
 
 # basic import structure of the h5 XPS files I have now (2026-07-20)
