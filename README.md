@@ -26,7 +26,8 @@ jupyter lab
 - `h5_import.ipynb` / `xy_import.ipynb` — walkthrough notebooks demonstrating
   how to load and plot each file type, with explanations before each step.
 - `utils/` — small shared helpers (e.g. type coercion for `.xy` metadata).
-- `data/` — example XPS data files used by the notebooks.
+- `data/` — not included in this repo. Place your own `.h5`/`.xy` files here
+  (the notebooks expect paths like `data/<filename>`) before running them.
 
 ## How it works
 
