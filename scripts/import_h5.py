@@ -297,7 +297,19 @@ def _load_xps_and_energy_axis(
     xps0 = f[resolve_path(f, run, paths.SPECTRUM_DATA)][()]
     xs = f[resolve_path(f, run, paths.X_AXIS)][()]
 
-    xps = np.sum(xps0, axis=1)
+    if xps0.ndim == 3:
+        # (iterations, channels, energy) -- the common case, e.g. a
+        # "fixed" acquisition repeated over many dwell-spaced sweeps.
+        xps = np.sum(xps0, axis=1)
+    else:
+        # (channels, energy) -- a one-shot acquisition (e.g. a single
+        # "Survey" scan) has no repeated-sweep/iterations axis at all,
+        # so summing over axis=1 here would collapse the energy axis
+        # instead of the channels axis. keepdims preserves a size-1
+        # leading axis so downstream code (which reads xps.shape[0] as
+        # the iteration count) still sees "1 iteration", correct for a
+        # single-shot scan.
+        xps = np.sum(xps0, axis=0, keepdims=True)
 
     en_mode_raw = f[resolve_path(f, run, paths.ENERGY_MODE)][()]
     en_mode = _decode_if_bytes(en_mode_raw)
@@ -382,23 +394,28 @@ class ScientaPeakLoader(BaseXPSLoader):
 
     name = "scienta_peak_h5"
 
-    def load(self, datapath: str | Path) -> list[Spectrum]:
+    def load(self, datapath: str | Path, run: str | None = None) -> list[Spectrum]:
         """
         Load every run (core-level spectrum) found in a Scienta PEAK
-        HDF5 sequence file.
- 
+        HDF5 sequence file — or, if `run` is given, just that one.
+
         Parameters
         ----------
         datapath : str or Path
             Path to the .h5 sequence file.
- 
+        run : str, optional
+            Load just this one run/entry (its 'shortcuts' name) instead
+            of every run in the file. Omit (the default) to load every
+            entry under 'shortcuts' together.
+
         Returns
         -------
         list[Spectrum]
-            One Spectrum per run (e.g. O1s, C1s, N1s), each with a
-            "raw" Node containing: xps, energy_axis, iter_axis,
-            acq_time, start_time, stop_time.
- 
+            One Spectrum per run (e.g. O1s, C1s, N1s) — or a single-
+            element list for just `run`, if given — each with a "raw"
+            Node containing: xps, energy_axis, iter_axis, acq_time,
+            start_time, stop_time.
+
         Raises
         ------
         FileNotFoundError
@@ -415,27 +432,30 @@ class ScientaPeakLoader(BaseXPSLoader):
             raise FileNotFoundError(f".h5 file not found {datapath}")
         if datapath.suffix.lower() != ".h5":
             raise ValueError(f"Expected a .h5 file, got {datapath.suffix} instead")
-        
+
         logger.info("Loading XPS sequence from '%s'", datapath)
 
         spectra: list[Spectrum] = []
 
         with h5py.File(datapath, 'r') as f:
+            if run is not None:
+                return [self._load_run(f, run, datapath)]
+
             if "shortcuts" not in f:
                 raise KeyError(
                     f"'shortcuts' group missing - is {datapath} a valid file?"
                 )
-            
+
             runs = list(f["shortcuts"].keys())
 
             if not runs:
                 raise ValueError(f"No runs found under 'shortcuts' in {datapath}")
-            
+
             logger.info(f"Found {len(runs)} run(s) in {datapath}: {runs}")
 
             for run in runs:
                 spectra.append(self._load_run(f, run, datapath))
-        
+
         return spectra
     
     def _load_run(self, f: h5py.File, run: str, datapath: Path) -> Spectrum:
@@ -512,7 +532,7 @@ class ScientaPeakSnapshotLoader(BaseXPSLoader):
 
     name = "scienta_peak_h5_snapshot"
 
-    def load(self, datapath: str | Path) -> list[Spectrum]:
+    def load(self, datapath: str | Path, run: str = "") -> list[Spectrum]:
         """
         Load the single spectrum found in a Scienta PEAK snapshot file.
 
@@ -520,6 +540,12 @@ class ScientaPeakSnapshotLoader(BaseXPSLoader):
         ----------
         datapath : str or Path
             Path to the .h5 snapshot file.
+        run : str, default ""
+            Name of the top-level group to treat as this snapshot's own
+            root, for a multi-entry container file holding several
+            spectra side by side. Omit ("") for a plain single-spectrum
+            snapshot file (all paths resolved straight from the file
+            root, the default behavior).
 
         Returns
         -------
@@ -550,13 +576,13 @@ class ScientaPeakSnapshotLoader(BaseXPSLoader):
 
         with h5py.File(datapath, "r") as f:
             xps, energy_axis, binding_energy, kinetic_energy, en_mode, energy_meta = (
-                _load_xps_and_energy_axis(f, "", XPSSnapshotPaths, datapath)
+                _load_xps_and_energy_axis(f, run, XPSSnapshotPaths, datapath)
             )
             no = xps.shape[0]
 
-            dwell_time = float(f[resolve_path(f, "", XPSSnapshotPaths.DWELL_TIME)][()])
+            dwell_time = float(f[resolve_path(f, run, XPSSnapshotPaths.DWELL_TIME)][()])
 
-            start_raw = f[resolve_path(f, "", XPSSnapshotPaths.START_TIME)][()]
+            start_raw = f[resolve_path(f, run, XPSSnapshotPaths.START_TIME)][()]
             start_dt64 = np.datetime64(_decode_if_bytes(start_raw), "ns")
 
         iter_axis = np.arange(no)
@@ -567,7 +593,7 @@ class ScientaPeakSnapshotLoader(BaseXPSLoader):
         stop_time = start_time + dwell_ns
         acq_time = (start_time.astype("datetime64[ns]") - EPOCH) / np.timedelta64(1, "s") + dwell_time / 2
 
-        spectrum = Spectrum(label=datapath.stem, source_file=datapath)
+        spectrum = Spectrum(label=run or datapath.stem, source_file=datapath)
         spectrum.add_node(
             "raw",
             meta={"dwell_time": dwell_time, **energy_meta},
@@ -582,7 +608,7 @@ class ScientaPeakSnapshotLoader(BaseXPSLoader):
         )
 
         logger.info(
-            "Loaded snapshot '%s': %d iteration(s), energy_mode=%s", datapath.stem, no, en_mode
+            "Loaded snapshot '%s': %d iteration(s), energy_mode=%s", spectrum.label, no, en_mode
         )
 
         return [spectrum]
@@ -846,6 +872,23 @@ class XPSEventPaths:
     STOP_TIME = "acquisition/spectrum_log/stop_time"
  
  
+def _clip_data_range(
+    data: np.ndarray,
+    data_range: tuple[float, float] | None = None,
+) -> tuple[float, float]:
+    """
+    (lo, hi) for `data`, clipped inward to `data`'s own min/max if
+    `data_range` is given but extends beyond what's actually present —
+    never wider than the real extent of the data. Shared by
+    `_compute_bin_edges` and the event loader's own auto-sizing of a
+    default time bin size against that same real extent.
+    """
+    data_min, data_max = float(np.min(data)), float(np.max(data))
+    if data_range is None:
+        return data_min, data_max
+    return max(data_range[0], data_min), min(data_range[1], data_max)
+
+
 def _compute_bin_edges(
     data: np.ndarray,
     bin_size: float,
@@ -853,20 +896,14 @@ def _compute_bin_edges(
 ) -> np.ndarray:
     """
     Compute histogram bin edges for `data`, clipped to the data's own extent.
- 
+
     If `data_range` is given but extends beyond what's actually present
     in `data`, it's clipped inward to the data's min/max (mirrors the
     original loader's behavior: never bin outside the range of real
     events). If `bin_size` is zero, non-positive, or larger than the
     full range, a single bin covering the whole range is returned.
     """
-    data_min, data_max = float(np.min(data)), float(np.max(data))
-    if data_range is None:
-        lo, hi = data_min, data_max
-    else:
-        lo = max(data_range[0], data_min)
-        hi = min(data_range[1], data_max)
- 
+    lo, hi = _clip_data_range(data, data_range)
     if bin_size <= 0 or bin_size >= (hi - lo):
         return np.array([lo, hi])
     return np.arange(lo, hi, bin_size)
@@ -894,6 +931,7 @@ class ScientaPeakEventLoader(BaseXPSLoader):
         time_range: tuple[float, float] | None = None,
         exposure_margin: float = 1.1,
         progress_callback: Callable[[int], None] | None = None,
+        run: str = "",
     ) -> list[Spectrum]:
         """
         Load and bin event-mode XPS data.
@@ -902,6 +940,12 @@ class ScientaPeakEventLoader(BaseXPSLoader):
         ----------
         datapath : str or Path
             Path to the .h5 event-mode file.
+        run : str, default ""
+            Name of the top-level group to treat as this event
+            dataset's own root, for a multi-entry container file
+            holding several spectra side by side. Omit ("") for a
+            plain single-spectrum event file (all paths resolved
+            straight from the file root, the default behavior).
         energy_bin_size : float
             Energy bin width in eV.
         energy_range : (float, float), optional
@@ -963,14 +1007,14 @@ class ScientaPeakEventLoader(BaseXPSLoader):
         logger.info("Loading XPS event data from %s", datapath)
  
         with h5py.File(datapath, "r") as f:
-            ts = f[resolve_path(f, "", XPSEventPaths.TIMESTAMPS)][()]
-            xs = f[resolve_path(f, "", XPSEventPaths.KINETIC_OFFSET)][()]
-            Eph = float(f[resolve_path(f, "", XPSEventPaths.EXCITATION_ENERGY)][()])
-            Wf, wf_meta = _select_work_function(f, "", XPSEventPaths, datapath)
-            exptime = f[resolve_path(f, "", XPSEventPaths.EXPOSURE_TIME)][()]
-            dwell_time = f[resolve_path(f, "", XPSEventPaths.DWELL_TIME)][()]
-            start_raw = f[resolve_path(f, "", XPSEventPaths.START_TIME)][()]
-            stop_raw = f[resolve_path(f, "", XPSEventPaths.STOP_TIME)][()]
+            ts = f[resolve_path(f, run, XPSEventPaths.TIMESTAMPS)][()]
+            xs = f[resolve_path(f, run, XPSEventPaths.KINETIC_OFFSET)][()]
+            Eph = float(f[resolve_path(f, run, XPSEventPaths.EXCITATION_ENERGY)][()])
+            Wf, wf_meta = _select_work_function(f, run, XPSEventPaths, datapath)
+            exptime = f[resolve_path(f, run, XPSEventPaths.EXPOSURE_TIME)][()]
+            dwell_time = f[resolve_path(f, run, XPSEventPaths.DWELL_TIME)][()]
+            start_raw = f[resolve_path(f, run, XPSEventPaths.START_TIME)][()]
+            stop_raw = f[resolve_path(f, run, XPSEventPaths.STOP_TIME)][()]
 
         logger.info("Loaded %d raw events; filtering to exposure window", len(ts))
 
@@ -999,12 +1043,24 @@ class ScientaPeakEventLoader(BaseXPSLoader):
             # around well before the nominal dwell time on some longer
             # acquisitions) — dwell_time is the authoritative duration.
             time_range = (0.0, float(dwell_time))
-        if time_bin_size is None:
-            time_bin_size = float(dwell_time) / 100
         time_range_ps = (time_range[0] * TIME_UNIT_SCALE, time_range[1] * TIME_UNIT_SCALE)
+        if time_bin_size is None:
+            # ~100 bins over the *real* extent of the recorded events
+            # within time_range, not the (possibly much larger)
+            # requested/nominal range itself — some acquisitions record
+            # real events well short of their nominal dwell_time, and
+            # the bin edges computed below are already clipped to that
+            # real extent, so sizing the step off the untrimmed range
+            # would silently produce far fewer than ~100 populated bins
+            # (e.g. dwell_time=40s but real events only span 2s: a step
+            # of 40/100=0.4s leaves only 5 populated bins over that 2s,
+            # not ~100).
+            lo, hi = _clip_data_range(ts, time_range_ps)
+            span_s = (hi - lo) / TIME_UNIT_SCALE
+            time_bin_size = span_s / 100 if span_s > 0 else (time_range[1] - time_range[0])
         energy_edges = _compute_bin_edges(kinetic_energy, energy_bin_size, energy_range)
         time_edges = _compute_bin_edges(ts, time_bin_size * TIME_UNIT_SCALE, time_range_ps)
- 
+
         logger.info(
             "Binning energy: %.4f to %.4f eV, step %.4f eV",
             energy_edges[0], energy_edges[-1], energy_bin_size,
@@ -1044,7 +1100,7 @@ class ScientaPeakEventLoader(BaseXPSLoader):
         start_dt64 = np.datetime64(_decode_if_bytes(start_raw))
         stop_dt64 = np.datetime64(_decode_if_bytes(stop_raw))
 
-        spectrum = Spectrum(label=datapath.stem, source_file=datapath)
+        spectrum = Spectrum(label=run or datapath.stem, source_file=datapath)
         spectrum.add_node(
             "raw",
             meta={"dwell_time": float(dwell_time), "excitation_energy": Eph, **wf_meta},

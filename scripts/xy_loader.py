@@ -14,6 +14,7 @@ circular-import trouble.
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass
 
@@ -24,6 +25,10 @@ from scripts.import_xy import Region, Scan
 logger = logging.getLogger(__name__)
 
 EPOCH = np.datetime64("1970-01-01T00:00:00")
+
+# "Time Zone Format: UTC" exports a bare "... UTC" suffix; "Time Zone Format:
+# Local Time" instead appends the local offset from UTC, e.g. "... UTC+2".
+_ACQ_DATE_RE = re.compile(r'^(?P<dt>.+?)\s+UTC(?P<offset>[+-]\d+(?::?\d{2})?)?$')
 
 # A scan missing more than this fraction of the reference region's energy
 # points is dropped outright rather than folded into the stacked array as
@@ -38,8 +43,25 @@ def _acquisition_datetime(scan: Scan) -> np.datetime64:
     raw = scan.metadata.get("Acquisition Date")
     if raw is None:
         raise ValueError("Scan is missing 'Acquisition Date'")
+    m = _ACQ_DATE_RE.match(raw)
+    if not m:
+        raise ValueError(f"Unrecognized 'Acquisition Date' format: {raw!r}")
     # e.g. "2023-10-27 08:34:22 UTC" -> "2023-10-27T08:34:22"
-    return np.datetime64(raw.replace(" UTC", "").replace(" ", "T"))
+    dt = np.datetime64(m.group("dt").replace(" ", "T"))
+    offset = m.group("offset")
+    if offset:
+        # e.g. "+2" -> 2 hours, "-2:30"/"−230" -> 2h30m, subtracted to convert
+        # this local-time reading back to UTC (local = UTC + offset).
+        sign = -1 if offset[0] == "-" else 1
+        body = offset[1:]
+        if ":" in body:
+            hours, minutes = body.split(":")
+        elif len(body) > 2:
+            hours, minutes = body[:-2], body[-2:]
+        else:
+            hours, minutes = body, "0"
+        dt -= np.timedelta64(sign * (int(hours) * 60 + int(minutes)), "m")
+    return dt
 
 
 def _reference_energy_axis(scans: list[Scan]) -> np.ndarray:
@@ -157,19 +179,25 @@ def stack_region(region: Region, file_metadata: dict) -> StackedRegion:
 
     dwell_time = float(region.metadata.get("Dwell Time") or 0.0)
 
-    # "Dwell Time" is the time spent *per energy point* (e.g. "# Dwell
+    # "Dwell Time" is the time spent per *dwell step* (e.g. "# Dwell
     # Time: 0.1" alongside "# Values/Curve: 141" in the file), not the
-    # whole scan's duration -- a full scan sweeps every point in
-    # `reference`, so its real duration is dwell_time * len(reference).
-    # Using dwell_time alone here previously left stop_time only a
-    # fraction of a second after start_time regardless of how long the
-    # scan actually took, which made a single scan's time window far
-    # too narrow to ever overlap an auxiliary log's sample points (see
-    # _spectrum_time_window/_filter_node_by_time in
-    # utils/spectrum_utils.py) even though the *region's* (multi-scan)
-    # window, spanning start_time.min() to stop_time.max() across
-    # scans, was wide enough to work fine.
-    scan_duration = dwell_time * len(reference)
+    # whole scan's duration -- a full scan sweeps "Values/Curve" many
+    # dwell steps, so its real duration is dwell_time * values_per_curve.
+    #
+    # values_per_curve reads the file's own "Values/Curve" field rather
+    # than assuming it always equals len(reference) (the region's energy
+    # point count): the two coincide for a classic swept scan (one dwell
+    # step per energy point), but not for a "snapshot" scan mode (e.g.
+    # SnapshotFAT), where the whole spectrum is captured by the detector
+    # in a single dwell step regardless of how many energy points it has
+    # (Values/Curve: 1 there) -- assuming len(reference) for that case
+    # previously inflated scan_duration (and therefore stop_time) by as
+    # much as the number of energy points itself. Falls back to
+    # len(reference) if the field is ever absent, matching the previous
+    # behavior.
+    values_per_curve = region.metadata.get("Values/Curve")
+    values_per_curve = int(values_per_curve) if values_per_curve is not None else len(reference)
+    scan_duration = dwell_time * values_per_curve
 
     # Acquisition Date strings only carry whole-second resolution, but
     # scan_duration is commonly sub-second -- rounding the start->stop
